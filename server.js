@@ -1,110 +1,182 @@
 const express = require('express');
-const { useMultiFileAuthState, makeWASocket, Browsers } = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
-
-// Initialize
+const crypto = require('crypto');
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = 8080;
+const host = '0.0.0.0';
 
-// Middleware
+// In-memory storage for pairing codes (use a database in production)
+const pairingCodes = new Map();
+
 app.use(express.json());
-app.use((req, res, next) => {
-  req.setTimeout(15000);
-  res.setTimeout(15000);
-  next();
-});
 
-// Session management
-const SESSIONS_DIR = path.join(__dirname, 'sessions');
-if (!fs.existsSync(SESSIONS_DIR)) {
-  fs.mkdirSync(SESSIONS_DIR);
+// Helper function to generate random pairing codes
+function generatePairingCode() {
+  return crypto.randomBytes(4).toString('hex').toUpperCase();
 }
 
-// Debug endpoint
-app.get('/debug', (req, res) => {
-  res.json({
-    status: 'active',
-    sessionsDir: fs.existsSync(SESSIONS_DIR),
-    system: {
-      node: process.version,
-      memory: process.memoryUsage().rss / (1024 * 1024) + 'MB'
-    }
-  });
-});
-
-// Pairing endpoint
-app.get('/pair', async (req, res) => {
+// Endpoint to generate a new pairing code
+app.post('/generate-pair-code', (req, res) => {
   try {
-    const { number } = req.query;
+    const { number } = req.body;
     
-    if (!number) {
+    if (!number || !/^\d{6,20}$/.test(number)) {
       return res.status(400).json({ 
         success: false,
-        message: 'Phone number is required'
+        message: 'Invalid phone number format' 
       });
     }
 
-    if (!number.match(/^254[17][0-9]{8}$/)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid Kenyan number format'
-      });
-    }
-
-    const sessionDir = path.join(SESSIONS_DIR, `session_${number}_${Date.now()}`);
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-
-    const socket = makeWASocket({
-      auth: state,
-      printQRInTerminal: false,
-      browser: Browsers.ubuntu('Firefox'),
-      logger: pino({ level: 'silent' })
-    });
-
-    socket.ev.on('creds.update', saveCreds);
-
-    // Connection with timeout
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Connection timeout')), 10000);
-
-      socket.ev.on('connection.update', (update) => {
-        if (update.connection === 'open') {
-          clearTimeout(timeout);
-          resolve();
-        }
-      });
-    });
-
-    const pairingCode = await socket.requestPairingCode(number);
+    // Generate a new code
+    const code = generatePairingCode();
+    const expiresAt = Date.now() + 300000; // 5 minutes expiration
     
-    res.json({
-      success: true,
-      pairCode: pairingCode.match(/.{1,3}/g)?.join('-'),
-      expiresIn: 120
+    // Store the code
+    pairingCodes.set(number, {
+      code,
+      expiresAt,
+      verified: false
     });
 
-    setTimeout(() => {
-      socket.end();
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    }, 120000);
+    return res.json({
+      success: true,
+      code,
+      expiresAt: new Date(expiresAt).toISOString()
+    });
 
   } catch (error) {
-    console.error('Pairing error:', error);
-    res.status(500).json({
+    console.error('Error generating pair code:', error);
+    return res.status(500).json({
       success: false,
-      message: error.message
+      message: 'Internal server error'
     });
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// Endpoint to verify a pairing code
+app.post('/verify-pair-code', (req, res) => {
+  try {
+    const { number, code } = req.body;
+    
+    if (!number || !code) {
+      return res.status(400).json({
+        success: false,
+        message: 'Number and code are required'
+      });
+    }
+
+    const storedData = pairingCodes.get(number);
+    
+    if (!storedData) {
+      return res.json({
+        success: false,
+        message: 'No active pairing session for this number'
+      });
+    }
+
+    if (Date.now() > storedData.expiresAt) {
+      pairingCodes.delete(number);
+      return res.json({
+        success: false,
+        message: 'Pairing code has expired'
+      });
+    }
+
+    if (storedData.code !== code.toUpperCase()) {
+      return res.json({
+        success: false,
+        message: 'Invalid pairing code'
+      });
+    }
+
+    // Mark as verified
+    pairingCodes.set(number, {
+      ...storedData,
+      verified: true
+    });
+
+    return res.json({
+      success: true,
+      message: 'Pairing code verified successfully'
+    });
+
+  } catch (error) {
+    console.error('Error verifying pair code:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
 });
 
-// Error handlers
-process.on('uncaughtException', (err) => {
-  console.error('Critical error:', err);
+// Endpoint to get credentials after successful pairing
+app.get('/get-credentials', (req, res) => {
+  try {
+    const { number } = req.query;
+    
+    if (!number) {
+      return res.status(400).json({
+        success: false,
+        message: 'Number is required'
+      });
+    }
+
+    const storedData = pairingCodes.get(number);
+    
+    if (!storedData) {
+      return res.json({
+        success: false,
+        message: 'No pairing session found'
+      });
+    }
+
+    if (!storedData.verified) {
+      return res.json({
+        success: false,
+        message: 'Pairing code not verified'
+      });
+    }
+
+    // In a real implementation, you would generate actual WhatsApp credentials here
+    const credentials = {
+      clientId: crypto.randomBytes(16).toString('hex'),
+      clientToken: crypto.randomBytes(32).toString('hex'),
+      serverToken: crypto.randomBytes(32).toString('hex'),
+      encKey: crypto.randomBytes(32).toString('hex'),
+      macKey: crypto.randomBytes(32).toString('hex'),
+      createdAt: new Date().toISOString()
+    };
+
+    // Clear the pairing code after successful credential generation
+    pairingCodes.delete(number);
+
+    return res.json({
+      success: true,
+      credentials
+    });
+
+  } catch (error) {
+    console.error('Error getting credentials:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Cleanup expired codes every hour
+setInterval(() => {
+  const now = Date.now();
+  for (const [number, data] of pairingCodes.entries()) {
+    if (now > data.expiresAt) {
+      pairingCodes.delete(number);
+    }
+  }
+}, 3600000); // 1 hour
+
+app.get('/', (req, res) => {
+  res.send("WhatsApp Pairing API is running");
+});
+
+app.listen(port, host, () => {
+  console.log(`Pairing API listening at http://${host}:${port}`);
 });
